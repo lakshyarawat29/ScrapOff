@@ -2,15 +2,12 @@
 
 /**
  * ScrapOff — ChatGPT Terminal Scraper
- * Automates chatgpt.com using Playwright and prints responses to the terminal.
+ * Opens chatgpt.com, types your prompt, waits for the response to stabilize,
+ * then prints everything (including code) to the terminal.
  */
 
 const { chromium } = require('playwright');
 const readline = require('readline');
-const fs = require('fs');
-const path = require('path');
-
-const SESSION_FILE = path.join(__dirname, 'session.json');
 
 // ─── ANSI colours ────────────────────────────────────────────────────────────
 const C = {
@@ -20,11 +17,12 @@ const C = {
   green:   '\x1b[32m',
   yellow:  '\x1b[33m',
   magenta: '\x1b[35m',
+  blue:    '\x1b[34m',
   red:     '\x1b[31m',
   gray:    '\x1b[90m',
   white:   '\x1b[97m',
 };
-const c = (color, text) => `${C[color]}${text}${C.reset}`;
+const c = (color, txt) => `${C[color]}${txt}${C.reset}`;
 
 // ─── Banner ───────────────────────────────────────────────────────────────────
 function printBanner() {
@@ -43,115 +41,180 @@ function printBanner() {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function ask(question) {
+function ask(ques) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans.trim()); }));
+  return new Promise(res => rl.question(ques, ans => { rl.close(); res(ans.trim()); }));
 }
 
 function startSpinner(text) {
-  const frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  const f = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
   let i = 0;
-  const iv = setInterval(() => {
-    process.stdout.write(`\r${c('cyan', frames[i++ % frames.length])}  ${c('dim', text)}`);
-  }, 100);
+  const iv = setInterval(() =>
+    process.stdout.write(`\r${c('cyan', f[i++ % f.length])}  ${c('dim', text)}`), 100);
   return () => { clearInterval(iv); process.stdout.write('\r\x1b[K'); };
 }
 
-// ─── Safe evaluate — never throws, always returns fallback ────────────────────
-async function safeEval(page, fn, fallback) {
+// ─── Safe page.evaluate — never throws ───────────────────────────────────────
+async function se(page, fn, fallback) {
   try { return await page.evaluate(fn); }
   catch { return fallback; }
 }
 
-// ─── Find the ChatGPT input with multiple selector fallbacks ──────────────────
-// Returns { selector, element } or null. Tries real ID first, then broader ones.
-async function findChatInput(page) {
-  const selectors = [
+// ─── Get page's full visible text ─────────────────────────────────────────────
+const pageText = page => se(page, () => document.body?.innerText ?? '', '');
+
+// ─── Wait for the response text to stabilize ─────────────────────────────────
+// Poll every 1 s; if text hasn't changed for 4 consecutive polls → done.
+async function waitForStable(page, growDeadlineMs = 90_000, stableMs = 120_000) {
+  // Phase 1 — wait for new text to START appearing
+  const initialLen = (await pageText(page)).length;
+  const growDeadline = Date.now() + growDeadlineMs;
+  let grew = false;
+
+  while (Date.now() < growDeadline) {
+    await sleep(700);
+    const len = (await pageText(page)).length;
+    if (len > initialLen + 80) { grew = true; break; }
+  }
+
+  if (!grew) return null; // nothing appeared
+
+  // Phase 2 — wait for text to STOP changing (stable for 4 s)
+  let prev = '';
+  let stableCount = 0;
+  const stableDeadline = Date.now() + stableMs;
+
+  while (Date.now() < stableDeadline) {
+    await sleep(1000);
+    const cur = await pageText(page);
+    if (cur && cur === prev) {
+      stableCount++;
+      if (stableCount >= 4) return cur;
+    } else {
+      stableCount = 0;
+      prev = cur;
+    }
+  }
+  return prev; // return whatever we have
+}
+
+// ─── Extract just the assistant reply from the full page text ─────────────────
+// Strategy: find the last occurrence of the user's message and take everything after.
+function extractReply(fullText, userMsg) {
+  // Match the first 40 chars of the user message to locate it
+  const probe = userMsg.substring(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matches = [...fullText.matchAll(new RegExp(probe, 'g'))];
+  if (matches.length === 0) return fullText.slice(-3000).trim();
+
+  const lastMatch = matches[matches.length - 1];
+  const after = fullText.slice(lastMatch.index + userMsg.length).trim();
+
+  // Remove trailing UI boilerplate (like "ChatGPT can make mistakes...")
+  return after
+    .replace(/\nChatGPT can make mistakes\..*$/s, '')
+    .replace(/\nThis content may violate.*$/s, '')
+    .trim();
+}
+
+// ─── Find and click the chat input ───────────────────────────────────────────
+async function clickInput(page) {
+  const SELS = [
     '#prompt-textarea',
     'div[contenteditable="true"]',
-    '[data-testid="composer-input"]',
     'textarea[tabindex="0"]',
+    'textarea[placeholder]',
     'textarea',
   ];
-  for (const sel of selectors) {
+  for (const sel of SELS) {
     try {
       const el = page.locator(sel).first();
-      const count = await el.count();
-      if (count > 0) return sel;
-    } catch { /* keep trying */ }
+      if (await el.count() > 0) {
+        await el.click({ timeout: 3000 });
+        return sel;
+      }
+    } catch { /* try next */ }
   }
   return null;
+}
+
+// ─── Submit the message ───────────────────────────────────────────────────────
+async function sendMessage(page, text) {
+  // Find and click the input
+  const sel = await clickInput(page);
+  if (!sel) throw new Error('Could not find a chat input on the page.');
+
+  await sleep(200);
+
+  // Clear any existing text
+  await page.keyboard.press('Meta+a');
+  await page.keyboard.press('Backspace');
+  await sleep(100);
+
+  // Type naturally (works with React + contenteditable)
+  await page.keyboard.type(text, { delay: 18 });
+  await sleep(350);
+
+  // Try clicking the send button first; fall back to Enter key
+  try {
+    const sendBtn = page.locator(
+      'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
+    ).first();
+    if (await sendBtn.count() > 0) {
+      await sendBtn.click({ timeout: 3000 });
+      return;
+    }
+  } catch { /* fall through to Enter */ }
+
+  await page.keyboard.press('Enter');
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   printBanner();
 
-  // ── Launch ────────────────────────────────────────────────────────────────
+  // Launch
   const stopLaunch = startSpinner('Launching Chromium ...');
   const browser = await chromium.launch({ headless: false, slowMo: 20 });
-
-  // Load saved session if it exists (skips login entirely)
-  const hasSession = fs.existsSync(SESSION_FILE);
-  const context = await browser.newContext({
+  const context  = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    ...(hasSession ? { storageState: SESSION_FILE } : {}),
   });
   const page = await context.newPage();
   stopLaunch();
 
-  if (hasSession) {
-    console.log(c('green', '  Saved session found — skipping login.'));
-  } else {
-    console.log(c('yellow', '  No saved session. You will need to log in once.'));
-  }
-
-  // ── Navigate ─────────────────────────────────────────────────────────────
+  // Navigate
   const stopNav = startSpinner('Opening chatgpt.com ...');
-  try {
-    await page.goto('https://chatgpt.com', { waitUntil: 'commit', timeout: 30000 });
-  } catch { /* redirect mid-load is fine */ }
+  try { await page.goto('https://chatgpt.com', { waitUntil: 'commit', timeout: 30000 }); }
+  catch { /* redirect is fine */ }
   stopNav();
 
-  // ── Wait for login + input — poll in a loop, show URL for debugging ────────
-  if (!hasSession) {
-    console.log(c('yellow', '\n  Log in to ChatGPT in the browser window that just opened.'));
-    console.log(c('gray',   '  Polling every 3s. Waiting up to 5 minutes ...\n'));
-  }
-
+  // Wait for a chat input to appear (up to 5 min — covers login if needed)
+  console.log(c('gray', '  Waiting for the chat input to appear ...\n'));
+  const stopWait = startSpinner('Loading ChatGPT ...');
   let inputSel = null;
   const deadline = Date.now() + 5 * 60 * 1000;
-  let lastUrl = '';
 
   while (Date.now() < deadline) {
-    await sleep(3000);
-
-    // Show current URL so user can see where the browser is
-    const url = await safeEval(page, () => window.location.href, '');
-    if (url && url !== lastUrl) {
+    await sleep(2000);
+    // Show URL changes
+    const url = await se(page, () => location.href, '');
+    if (url && url !== (inputSel ?? '')) {
       process.stdout.write('\r\x1b[K');
-      console.log(c('gray', `  Browser: ${url}`));
-      lastUrl = url;
+      console.log(c('gray', `  → ${url}`));
     }
-
-    inputSel = await findChatInput(page);
+    inputSel = await clickInput(page).catch(() => null);
     if (inputSel) break;
   }
+  stopWait();
 
   if (!inputSel) {
-    console.log(c('red', '\n  Timed out — could not find a chat input. Make sure you are logged in.\n'));
+    console.log(c('red', '\n  Timed out — no chat input found.\n'));
     await browser.close();
     process.exit(1);
   }
 
-  // ── Save session for next run ─────────────────────────────────────────────
-  await context.storageState({ path: SESSION_FILE });
-  console.log(c('gray', `  Session saved to session.json (reused on next run).`));
-
-  console.log(c('green', `\n  ChatGPT ready! (input selector: ${inputSel})\n`));
-  console.log(c('gray',  '  Type a message and hit Enter. Type "exit" to quit.\n'));
+  console.log(c('green', `  Ready! Type a message below. Type "exit" to quit.\n`));
 
   // ── Conversation loop ─────────────────────────────────────────────────────
   while (true) {
@@ -161,108 +224,56 @@ async function main() {
       break;
     }
 
-    // Snapshot current page text length so we know when NEW content arrives
-    const prevTextLen = await safeEval(
-      page,
-      () => document.body?.innerText?.length ?? 0,
-      0
-    );
-
-    // ── Type and submit ───────────────────────────────────────────────────────
+    // Send
     try {
-      // Re-find in case the page navigated (new chat, etc.)
-      inputSel = (await findChatInput(page)) ?? inputSel;
-
-      const el = page.locator(inputSel).first();
-      await el.click();
-      await sleep(150);
-
-      // Clear existing text
-      await page.keyboard.press('Meta+a');
-      await page.keyboard.press('Backspace');
-      await sleep(100);
-
-      // Type message (keyboard events work with React/contenteditable)
-      await page.keyboard.type(userInput, { delay: 20 });
-      await sleep(400);
-      await page.keyboard.press('Enter');
+      await sendMessage(page, userInput);
     } catch (err) {
-      console.log(c('red', `  Could not type message: ${err.message}\n`));
+      console.log(c('red', `  Send failed: ${err.message}\n`));
       continue;
     }
 
-    // ── Phase 1: wait for ChatGPT to START generating (stop-btn appears) ──────
-    const stopWaitReply = startSpinner('Waiting for ChatGPT to start replying ...');
-    let replyStarted = false;
-    const replyDeadline = Date.now() + 90_000;
+    // Wait for the response to appear and stabilize
+    const stopSpin = startSpinner('ChatGPT is thinking ...');
+    const fullText = await waitForStable(page);
+    stopSpin();
 
-    while (Date.now() < replyDeadline) {
-      await sleep(600);
-
-      // Method A: stop button appeared → ChatGPT is generating
-      const hasStopBtn = await safeEval(page, () => !!(
-        document.querySelector('button[data-testid="stop-button"]')    ||
-        document.querySelector('button[aria-label="Stop generating"]')  ||
-        document.querySelector('[aria-label="Stop streaming"]')
-      ), false);
-      if (hasStopBtn) { replyStarted = true; break; }
-
-      // Method B: page text grew — new content arrived even if stop-btn wasn't caught
-      const curLen = await safeEval(page, () => document.body?.innerText?.length ?? 0, 0);
-      if (curLen > prevTextLen + 30) { replyStarted = true; break; }
-    }
-    stopWaitReply();
-
-    if (!replyStarted) {
-      console.log(c('red', '  No reply detected — the message may not have been sent. Try again.\n'));
+    if (!fullText) {
+      console.log(c('yellow', '  (No response detected — check the browser)\n'));
       continue;
     }
 
-    // ── Phase 2: wait for ChatGPT to FINISH (stop-btn disappears) ────────────
-    const stopWaitStream = startSpinner('ChatGPT is writing ...');
-    const streamDeadline = Date.now() + 180_000;
-
-    while (Date.now() < streamDeadline) {
-      await sleep(800);
-      const stillStreaming = await safeEval(page, () => !!(
-        document.querySelector('button[data-testid="stop-button"]')    ||
-        document.querySelector('button[aria-label="Stop generating"]')  ||
-        document.querySelector('[aria-label="Stop streaming"]')
-      ), false); // default false = assume done on error
-      if (!stillStreaming) break;
-    }
-    stopWaitStream();
-
-    await sleep(1000); // buffer for final tokens
-
-    // ── Scrape last assistant message — try multiple selector strategies ────────
-    const response = await safeEval(page, () => {
-      const getText = (sel) => {
-        const els = document.querySelectorAll(sel);
-        return els.length ? els[els.length - 1].innerText.trim() : null;
-      };
-      return (
-        getText('[data-message-author-role="assistant"]') ||
-        getText('article')                               ||
-        getText('[class*="markdown"]')                   ||
-        getText('.prose')                                ||
-        getText('[class*="prose"]')                      ||
-        getText('[class*="message"]')                    ||
-        ''
-      );
-    }, '');
+    const response = extractReply(fullText, userInput);
 
     if (!response) {
-      console.log(c('yellow', '  (Empty response — check the browser window)\n'));
+      console.log(c('yellow', '  (Could not extract reply — check the browser)\n'));
       continue;
     }
 
+    // ── Print ────────────────────────────────────────────────────────────────
     console.log('');
     console.log(c('magenta', '  ── ChatGPT ──────────────────────────────────────────────────────────'));
     console.log('');
     response.split('\n').forEach(line => console.log(c('white', `  ${line}`)));
     console.log('');
     console.log(c('magenta', '  ──────────────────────────────────────────────────────────────────────'));
+
+    // ── Stats ────────────────────────────────────────────────────────────────
+    const clean = response
+      .replace(/\[image[^\]]*\]/gi, '')
+      .replace(/!\[.*?\]\(.*?\)/g, '')
+      .trim();
+    const words    = clean.split(/\s+/).filter(Boolean).length;
+    const chars    = clean.replace(/\s/g, '').length;
+    const readMins = Math.max(1, Math.round(words / 200));
+
+    console.log(
+      c('gray', '\n  📊  ') +
+      c('cyan',    `${words.toLocaleString()} words`) +
+      c('gray',    '  ·  ') +
+      c('blue',    `${chars.toLocaleString()} chars`) +
+      c('gray',    '  ·  ') +
+      c('magenta', `~${readMins} min read`)
+    );
     console.log('');
   }
 
